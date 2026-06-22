@@ -71,26 +71,16 @@ When set to `auto', derive the platform from `system-type'."
 
 (defvar tldr--buffer-name "*tldr*")
 
-(defun tldr--auto-locale ()
-  (let (locale)
-    (dolist (var '("LC_ALL" "LC_MESSAGES" "LANG"))
-      (unless locale
-        (setq locale (getenv var))))
-    locale))
-
-(defun tldr--english-locale-p (locale)
-  (member locale '("" "C" "POSIX" "C.UTF-8")))
-
 (defun tldr--locale-base (locale)
   (let ((locale (string-trim (or locale ""))))
-    (unless (tldr--english-locale-p locale)
+    (unless (member locale '("" "C" "POSIX" "C.UTF-8"))
       (setq locale (replace-regexp-in-string "[.@].*\\'" "" locale))
       (unless (string-empty-p locale)
         locale))))
 
 (defun tldr--language-value ()
   (if (memq tldr-language '(auto nil))
-      (tldr--auto-locale)
+      (or (getenv "LC_ALL") (getenv "LC_MESSAGES") (getenv "LANG"))
     (if (symbolp tldr-language)
         (symbol-name tldr-language)
       tldr-language)))
@@ -115,7 +105,6 @@ When set to `auto', derive the platform from `system-type'."
      ((eq platform 'gnu/linux) "linux")
      ((memq platform '(windows-nt ms-dos cygwin)) "windows")
      ((stringp platform) platform)
-     ((not (eq tldr-platform 'auto)) (symbol-name platform))
      (t "common"))))
 
 (defun tldr--platform-directories (&optional platform)
@@ -170,8 +159,7 @@ When set to `auto', derive the platform from `system-type'."
 (defun tldr--valid-command-p (command)
   (and (stringp command)
        (not (string-empty-p command))
-       (not (string-match-p "[/\0]" command))
-       (not (member command '("." "..")))))
+       (not (string-match-p "/" command))))
 
 (defun tldr--check-command (command)
   (let ((command (tldr--command-from-string command)))
@@ -183,12 +171,11 @@ When set to `auto', derive the platform from `system-type'."
 
 (defun tldr--candidate-files (command)
   "Return finite ordered candidate page files for COMMAND."
-  (let ((command (tldr--check-command command)))
-    (cl-loop for language in (tldr--language-directories)
-             append (cl-loop for platform in (tldr--platform-directories)
-                             collect (expand-file-name
-                                      (format "%s/%s/%s.md" language platform command)
-                                      tldr-pages-directory)))))
+  (cl-loop for language in (tldr--language-directories)
+           append (cl-loop for platform in (tldr--platform-directories)
+                           collect (expand-file-name
+                                    (format "%s/%s/%s.md" language platform command)
+                                    tldr-pages-directory))))
 
 (defun tldr--command-directories ()
   (cl-loop for language in (tldr--language-directories)
@@ -210,8 +197,7 @@ When set to `auto', derive the platform from `system-type'."
     (nreverse commands)))
 
 (defun tldr--find-page (command)
-  (let* ((command (tldr--check-command command))
-         (file (cl-find-if #'file-readable-p (tldr--candidate-files command))))
+  (let ((file (cl-find-if #'file-readable-p (tldr--candidate-files command))))
     (unless file
       (user-error "No tldr page found for %s" command))
     file))
@@ -283,24 +269,17 @@ When set to `auto', derive the platform from `system-type'."
         (push tail elements)))
     (nreverse elements)))
 
-(defun tldr--tempel-template (command)
-  "Return a Tempel template for COMMAND."
-  (tldr--template-elements command))
-
-(defun tldr--tempo-template (command)
-  "Return a Tempo template for COMMAND."
-  (tldr--template-elements command))
-
 (defun tldr--insert-template (command)
-  (if tldr-use-tempel
-      (progn
-        (unless (require 'tempel nil t)
-          (user-error "Tempel is not available"))
-        (tempel-insert (tldr--tempel-template command)))
-    (let ((tempo-interactive t)
-          (template-symbol (make-symbol "tldr-tempo-template")))
-      (set template-symbol (tldr--tempo-template command))
-      (tempo-insert-template template-symbol nil))))
+  (let ((template (tldr--template-elements command)))
+    (if tldr-use-tempel
+        (progn
+          (unless (require 'tempel nil t)
+            (user-error "Tempel is not available"))
+          (tempel-insert template))
+      (let ((tempo-interactive t)
+            (template-symbol (make-symbol "tldr-tempo-template")))
+        (set template-symbol template)
+        (tempo-insert-template template-symbol nil)))))
 
 (defvar tldr-mode-map
   (let ((map (make-sparse-keymap)))
@@ -353,8 +332,7 @@ When set to `auto', derive the platform from `system-type'."
   (tldr--render-page page))
 
 (defun tldr--open (command &optional example-index source-marker)
-  (let* ((command (tldr--check-command command))
-         (page (tldr--read-page command))
+  (let* ((page (tldr--read-page command))
          (buffer (get-buffer-create tldr--buffer-name))
          (source-marker (or source-marker (point-marker))))
     (with-current-buffer buffer
@@ -468,8 +446,7 @@ When set to `auto', derive the platform from `system-type'."
            collect (propertize display 'tldr--consult-data data)))
 
 (defun tldr--consult-data (candidate)
-  (or (get-text-property 0 'tldr--consult-data candidate)
-      (user-error "Unknown tldr candidate: %s" candidate)))
+  (get-text-property 0 'tldr--consult-data candidate))
 
 (defun tldr--consult-lookup (selected candidates &rest _)
   (unless (string-empty-p selected)
@@ -565,11 +542,7 @@ CANDIDATE must be the propertized string returned by
   (dolist (buffer (buffer-list))
     (with-current-buffer buffer
       (when (eq major-mode 'tldr-mode)
-        (condition-case err
-            (tldr-reload)
-          (error (message "Could not refresh %s: %s"
-                          (buffer-name buffer)
-                          (error-message-string err))))))))
+        (tldr-reload)))))
 
 ;;;###autoload
 (defun tldr-update ()

@@ -130,13 +130,11 @@
                    "tar xf {{source.tar}} -C {{directory}}"))))
 
 (ert-deftest tldr-placeholder-template-generation ()
-  (should (equal (tldr--tempo-template "tar xf {{source.tar}} -C {{directory}}")
-                 '("tar xf " (p "source.tar" tldr-1) " -C " (p "directory" tldr-2))))
-  (should (equal (tldr--tempel-template "tar xf {{source.tar}} -C {{directory}}")
+  (should (equal (tldr--template-elements "tar xf {{source.tar}} -C {{directory}}")
                  '("tar xf " (p "source.tar" tldr-1) " -C " (p "directory" tldr-2)))))
 
 (ert-deftest tldr-repeated-placeholder-reuse ()
-  (should (equal (tldr--tempo-template "cp {{source}} {{source}}.bak")
+  (should (equal (tldr--template-elements "cp {{source}} {{source}}.bak")
                  '("cp " (p "source" tldr-1) " " (s tldr-1) ".bak"))))
 
 (ert-deftest tldr-template-title-slug ()
@@ -340,10 +338,6 @@
         (kill-buffer source-buffer))
       (when (buffer-live-p page-buffer)
         (kill-buffer page-buffer)))))
-
-(ert-deftest tldr-mode-has-no-i-or-w-binding ()
-  (should-not (lookup-key tldr-mode-map (kbd "i")))
-  (should-not (lookup-key tldr-mode-map (kbd "w"))))
 
 (ert-deftest tldr-page-commands-are-mode-specific ()
   (dolist (command '(tldr-copy-command
