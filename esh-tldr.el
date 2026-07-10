@@ -1,25 +1,28 @@
 ;;; esh-tldr.el --- Browse local tldr pages -*- lexical-binding: t; -*-
 
 ;; Author: roifewu
-;; Package-Requires: ((emacs "27.1"))
+;; Package-Requires: ((emacs "31.0"))
 ;; Keywords: help, tools
 
 ;;; Commentary:
 
-;; Browse local tldr pages, copy examples, and insert examples as templates.
+;; Browse local tldr pages and insert examples as editable templates.
+;; `esh-tldr' uses Emacs' standard completion protocol.  `esh-tldr-dwim'
+;; understands regular buffers, Eshell, Comint, and Shell.  Additional
+;; terminal integrations can register context and target handlers.
 
 ;;; Code:
 
+(require 'button)
 (require 'cl-lib)
 (require 'comint)
+(require 'help-mode)
 (require 'subr-x)
 (require 'tempo)
 (require 'thingatpt)
 
-(declare-function consult--read "consult" (table &rest options))
 (declare-function tempel-insert "ext:tempel" (template))
-(defvar embark-default-action-overrides)
-(defvar embark-keymap-alist)
+(defvar eshell-last-output-end)
 
 (defgroup esh-tldr nil
   "Browse local tldr pages."
@@ -56,8 +59,12 @@ When set to `auto', derive the platform from `system-type'."
   "Face for esh-tldr headings.")
 
 (defface esh-tldr-command-face
-  '((t :inherit fixed-pitch :weight bold))
+  '((t :inherit fixed-pitch :weight semi-bold))
   "Face for esh-tldr example commands.")
+
+(defface esh-tldr-placeholder-face
+  '((t :inherit font-lock-variable-name-face :weight bold))
+  "Face for placeholders in esh-tldr example commands.")
 
 (cl-defstruct (esh-tldr--example (:constructor esh-tldr--make-example))
   description command)
@@ -65,22 +72,54 @@ When set to `auto', derive the platform from `system-type'."
 (cl-defstruct (esh-tldr--page (:constructor esh-tldr--make-page))
   title description examples file)
 
+(cl-defstruct (esh-tldr--target (:constructor esh-tldr--make-target))
+  "A source range which an example may replace.
+HANDLER, when non-nil, performs integration-specific replacement.  DATA
+holds opaque state owned by that handler."
+  buffer start end original handler data)
+
+(cl-defstruct (esh-tldr--context (:constructor esh-tldr--make-context))
+  command target)
+
 (defvar-local esh-tldr--command nil)
 (defvar-local esh-tldr--page nil)
-(defvar-local esh-tldr--source-marker nil)
+(defvar-local esh-tldr--source-target nil)
 
-(defvar esh-tldr--buffer-name "*esh-tldr*")
+(defvar esh-tldr--buffer-name "*esh-tldr*"
+  "Name of the reusable TL;DR help buffer.")
+(defvar esh-tldr-command-history nil
+  "Minibuffer history for TL;DR command selection.")
+(defvar esh-tldr--command-entry-cache nil
+  "Cached command entries as (KEY . ENTRIES).")
+
+(define-error 'esh-tldr-unsafe-replacement
+  "The saved source can no longer be replaced safely"
+  'user-error)
+
+(defvar esh-tldr-context-functions nil
+  "Abnormal hook for optional context providers.
+Each function is called with no arguments in the source buffer and should
+return an `esh-tldr--context' or nil.")
+
+(defvar esh-tldr-fallback-target-functions nil
+  "Abnormal hook for optional zero-width target providers.
+Each function is called with no arguments in the source buffer and should
+return an `esh-tldr--target' or nil.")
+
+;;; Page discovery and parsing
 
 (defun esh-tldr--locale-base (locale)
   (let ((locale (string-trim (or locale ""))))
-    (unless (member locale '("" "C" "POSIX" "C.UTF-8"))
-      (setq locale (replace-regexp-in-string "[.@].*\\'" "" locale))
-      (unless (string-empty-p locale)
-        locale))))
+    (setq locale (replace-regexp-in-string "[.@].*\\'" "" locale))
+    (unless (member locale '("" "C" "POSIX"))
+      locale)))
 
 (defun esh-tldr--language-value ()
   (if (memq esh-tldr-language '(auto nil))
-      (or (getenv "LC_ALL") (getenv "LC_MESSAGES") (getenv "LANG"))
+      (cl-loop for variable in '("LC_ALL" "LC_MESSAGES" "LANG")
+               for value = (getenv variable)
+               when (and value (not (string-empty-p (string-trim value))))
+               return value)
     (if (symbolp esh-tldr-language)
         (symbol-name esh-tldr-language)
       esh-tldr-language)))
@@ -95,87 +134,27 @@ When set to `auto', derive the platform from `system-type'."
                 (list (concat "pages." (match-string 1 base))))
               '("pages")))))
 
-(defun esh-tldr--platform-name (&optional platform)
-  (let ((platform (or platform
-                      (if (eq esh-tldr-platform 'auto)
-                          system-type
-                        esh-tldr-platform))))
-    (cond
-     ((eq platform 'darwin) "osx")
-     ((eq platform 'gnu/linux) "linux")
-     ((memq platform '(windows-nt ms-dos cygwin)) "windows")
-     ((stringp platform) platform)
-     (t "common"))))
-
 (defun esh-tldr--platform-directories (&optional platform)
   "Return ordered esh-tldr platform directories for PLATFORM."
-  (let ((name (esh-tldr--platform-name platform)))
+  (let* ((platform (or platform
+                       (if (eq esh-tldr-platform 'auto)
+                           system-type
+                         esh-tldr-platform)))
+         (name (cond
+                ((eq platform 'darwin) "osx")
+                ((eq platform 'gnu/linux) "linux")
+                ((memq platform '(windows-nt ms-dos cygwin)) "windows")
+                ((stringp platform) platform)
+                (t "common"))))
     (if (string= name "common")
         '("common")
       (list name "common"))))
 
-(defun esh-tldr--command-from-string (string)
-  (let* ((parts (split-string (string-trim (or string ""))
-                              "\\(?:&&\\|||\\|[;|]\\)" t "[ \t\n]+"))
-         (command (car (last parts)))
-         (tokens (and command (split-string command "[ \t\n]+" t))))
-    (while (and tokens (string-match-p "\\`[[:alnum:]_]+=" (car tokens)))
-      (setq tokens (cdr tokens)))
-    (when-let* ((token (car tokens))
-                (name (file-name-nondirectory token)))
-      (unless (string-empty-p name)
-        name))))
-
-(defun esh-tldr--command-at-point ()
-  (when-let* ((bounds (or (bounds-of-thing-at-point 'filename)
-                          (bounds-of-thing-at-point 'symbol)))
-              (text (buffer-substring-no-properties (car bounds) (cdr bounds))))
-    (esh-tldr--command-from-string text)))
-
-(defun esh-tldr--region-command ()
-  (when (use-region-p)
-    (esh-tldr--command-from-string
-     (buffer-substring-no-properties (region-beginning) (region-end)))))
-
-(defun esh-tldr--shell-input ()
-  (when (derived-mode-p 'shell-mode 'comint-mode 'eshell-mode)
-    (let ((beg (cond
-                ((derived-mode-p 'comint-mode) (comint-line-beginning-position))
-                ((and (boundp 'eshell-last-output-end)
-                      (markerp eshell-last-output-end))
-                 (max (point-min) (marker-position eshell-last-output-end)))
-                (t (line-beginning-position)))))
-      (buffer-substring-no-properties beg (point)))))
-
-(defun esh-tldr--shell-command ()
-  (when-let* ((input (esh-tldr--shell-input)))
-    (esh-tldr--command-from-string input)))
-
-(defun esh-tldr--default-command ()
-  (or (esh-tldr--region-command)
-      (esh-tldr--shell-command)
-      (esh-tldr--command-at-point)))
-
-(defun esh-tldr--valid-command-p (command)
-  (and (stringp command)
-       (not (string-empty-p command))
-       (not (string-match-p "/" command))))
-
-(defun esh-tldr--check-command (command)
-  (let ((command (esh-tldr--command-from-string command)))
-    (unless command
-      (user-error "Command name is empty"))
-    (unless (esh-tldr--valid-command-p command)
-      (user-error "Illegal command name: %s" command))
-    command))
-
 (defun esh-tldr--candidate-files (command)
   "Return finite ordered candidate page files for COMMAND."
-  (cl-loop for language in (esh-tldr--language-directories)
-           append (cl-loop for platform in (esh-tldr--platform-directories)
-                           collect (expand-file-name
-                                    (format "%s/%s/%s.md" language platform command)
-                                    esh-tldr-pages-directory))))
+  (mapcar (lambda (directory)
+            (expand-file-name (concat command ".md") directory))
+          (esh-tldr--command-directories)))
 
 (defun esh-tldr--command-directories ()
   (cl-loop for language in (esh-tldr--language-directories)
@@ -184,23 +163,56 @@ When set to `auto', derive the platform from `system-type'."
                                     (format "%s/%s" language platform)
                                     esh-tldr-pages-directory))))
 
-(defun esh-tldr--command-candidates ()
-  "Return tldr command candidates from the active language/platform directories."
-  (let (seen commands)
-    (dolist (directory (esh-tldr--command-directories))
-      (when (file-directory-p directory)
-        (dolist (file (directory-files directory nil "\\.md\\'"))
-          (let ((command (file-name-sans-extension file)))
-            (unless (member command seen)
-              (push command seen)
-              (push command commands))))))
-    (nreverse commands)))
+(defun esh-tldr--command-cache-key (directories)
+  "Return a cache key for DIRECTORIES."
+  (list directories
+        (mapcar
+         (lambda (directory)
+           (file-attribute-modification-time
+            (file-attributes directory 'string)))
+         directories)))
 
-(defun esh-tldr--find-page (command)
-  (let ((file (cl-find-if #'file-readable-p (esh-tldr--candidate-files command))))
-    (unless file
-      (user-error "No tldr page found for %s" command))
-    file))
+(defun esh-tldr--clear-command-cache ()
+  "Discard cached command completion entries."
+  (setq esh-tldr--command-entry-cache nil))
+
+(defun esh-tldr--command-candidate-entries ()
+  "Return ordered (COMMAND . SOURCE) entries for standard completion."
+  (let* ((directories (esh-tldr--command-directories))
+         (key (esh-tldr--command-cache-key directories)))
+    (if (equal key (car esh-tldr--command-entry-cache))
+        (cdr esh-tldr--command-entry-cache)
+      (let ((seen (make-hash-table :test #'equal))
+            entries)
+        (dolist (directory directories)
+          (when (file-directory-p directory)
+            (dolist (file (directory-files directory nil "\\.md\\'"))
+              (let ((command (file-name-sans-extension file)))
+                (unless (gethash command seen)
+                  (puthash command t seen)
+                  (push (cons command
+                              (file-relative-name
+                               directory esh-tldr-pages-directory))
+                        entries))))))
+        (setq entries (nreverse entries)
+              esh-tldr--command-entry-cache (cons key entries))
+        entries))))
+
+(defun esh-tldr--completion-table (entries)
+  "Build an Emacs 31 completion table from command ENTRIES."
+  (let ((annotations (make-hash-table :test #'equal)))
+    (dolist (entry entries)
+      (puthash (car entry) (cdr entry) annotations))
+    (completion-table-with-metadata
+     (mapcar #'car entries)
+     `((category . esh-tldr-command)
+       (annotation-function
+        . ,(lambda (candidate)
+             (when-let* ((source (gethash candidate annotations)))
+               (propertize (concat "  " source)
+                           'face 'completions-annotations))))
+       (eager-display . t)
+       (eager-update . t)))))
 
 (defun esh-tldr--parse-page (file)
   "Parse a tldr markdown FILE."
@@ -216,30 +228,205 @@ When set to `auto', derive the platform from `system-type'."
          ((string-match "\\`- +\\(.+\\):[ \t]*\\'" line)
           (setq pending (match-string 1 line)))
          ((and pending (string-match "\\`[ \t]*`\\(.+\\)`[ \t]*\\'" line))
-          (push (esh-tldr--make-example :description pending
-                                    :command (match-string 1 line))
+          (push (esh-tldr--make-example
+                 :description pending
+                 :command (match-string 1 line))
                 examples)
           (setq pending nil))))
-      (esh-tldr--make-page :title title
-                       :description (string-join (nreverse descriptions) "\n")
-                       :examples (nreverse examples)
-                       :file file))))
+      (esh-tldr--make-page
+       :title title
+       :description (string-join (nreverse descriptions) "\n")
+       :examples (nreverse examples)
+       :file file))))
 
 (defun esh-tldr--read-page (command)
-  (esh-tldr--parse-page (esh-tldr--find-page command)))
+  "Return the parsed page for COMMAND, or nil when it is unavailable."
+  (when-let* ((file (cl-find-if #'file-readable-p
+                                (esh-tldr--candidate-files command))))
+    (esh-tldr--parse-page file)))
 
-(defun esh-tldr--slug (description)
-  (let ((slug (downcase description)))
-    (setq slug (replace-regexp-in-string "[][()]" "" slug))
-    (setq slug (replace-regexp-in-string "[,.][ \t\n]*" "_" slug))
-    (setq slug (replace-regexp-in-string "[^[:alnum:]_ -]" "" slug))
-    (setq slug (replace-regexp-in-string "[ \t\n]+" "-" slug))
-    (setq slug (replace-regexp-in-string "-+" "-" slug))
-    (setq slug (replace-regexp-in-string "_+" "_" slug))
-    (string-trim slug "[-_]+" "[-_]+")))
+;;; Shell parsing and source targets
 
-(defun esh-tldr--template-name (command description)
-  (concat command "/" (esh-tldr--slug description)))
+(defun esh-tldr--shell-segment-bounds (string offset)
+  "Return the simple-command bounds in STRING containing OFFSET.
+Unquoted shell control operators delimit segments.  Return nil for nested
+or incomplete shell syntax rather than risk replacing the wrong token."
+  (catch 'unsafe
+    (let ((length (length string))
+          (offset (max 0 (min offset (length string))))
+          (start 0)
+          quote escaped result
+          (index 0))
+      (while (and (< index length) (not result))
+        (let ((char (aref string index))
+              (next (and (< (1+ index) length)
+                         (aref string (1+ index)))))
+          (cond
+           (escaped (setq escaped nil))
+           ((and quote (= char quote)) (setq quote nil))
+           ((and (not (eq quote ?\')) (= char ?\\)) (setq escaped t))
+           ((and (not (eq quote ?\'))
+                 (or (= char ?`)
+                     (and (= char ?$) (eq next 40))))
+            (throw 'unsafe nil))
+           ((and (not quote) (memq char '(40 41)))
+            (throw 'unsafe nil))
+           ((and (not quote) (memq char '(?\' ?\"))) (setq quote char))
+           ((and (not quote)
+                 (= char ?#)
+                 (or (zerop index)
+                     (memq (aref string (1- index))
+                           '(?\s ?\t ?\n ?\; ?\| ?\&))))
+            (setq result (cons start index)))
+           ((and (not quote) (memq char '(?\; ?\| ?\& ?\n)))
+            (let ((operator-end
+                   (if (and next (memq char '(?\| ?\&)) (= char next))
+                       (+ index 2)
+                     (1+ index))))
+              (if (<= offset index)
+                  (setq result (cons start index))
+                (setq start operator-end))
+              (setq index (1- operator-end))))))
+        (setq index (1+ index)))
+      (when (or quote escaped)
+        (throw 'unsafe nil))
+      (or result (cons start length)))))
+
+(defun esh-tldr--command-token-in-range (string start end)
+  "Return the first non-assignment token in STRING between START and END."
+  (catch 'command
+    (let ((index start))
+      (while (< index end)
+        (while (and (< index end)
+                    (memq (aref string index) '(?\s ?\t ?\n)))
+          (setq index (1+ index)))
+        (when (< index end)
+          (let ((token-start index)
+                quote escaped)
+            (while (and (< index end)
+                        (or quote escaped
+                            (not (memq (aref string index) '(?\s ?\t ?\n)))))
+              (let ((char (aref string index)))
+                (cond
+                 (escaped (setq escaped nil))
+                 ((and quote (= char quote)) (setq quote nil))
+                 ((and (not (eq quote ?\')) (= char ?\\)) (setq escaped t))
+                 ((and (not quote) (memq char '(?\' ?\"))) (setq quote char))))
+              (setq index (1+ index)))
+            (let* ((raw (substring string token-start index))
+                   (value (condition-case nil
+                              (or (car (split-string-shell-command raw)) raw)
+                            (error raw))))
+              (unless (string-match-p
+                       "\\`[[:alpha:]_][[:alnum:]_]*=" value)
+                (when (string-match-p "\\`[<>]" value)
+                  (throw 'command nil))
+                (throw 'command (list value token-start index))))))))))
+
+(defun esh-tldr--command-token-in-string (string offset)
+  "Return (COMMAND START END) for the command token at OFFSET in STRING."
+  (when-let* ((bounds (esh-tldr--shell-segment-bounds string offset)))
+    (pcase-let* ((`(,segment-start . ,segment-end) bounds)
+                 (token (esh-tldr--command-token-in-range
+                         string segment-start segment-end)))
+      (when-let* ((token token)
+                  (value (car token))
+                  (command (file-name-nondirectory value))
+                  ((not (string-empty-p command))))
+        (list command (nth 1 token) (nth 2 token))))))
+
+(defun esh-tldr--command-from-string (string)
+  (let ((string (string-trim-right (or string ""))))
+    (when-let* ((token (esh-tldr--command-token-in-string
+                        string (length string))))
+      (car token))))
+
+(defun esh-tldr--valid-command-p (command)
+  (and (stringp command)
+       (not (string-empty-p command))
+       (not (string-match-p "[/\\\\]" command))))
+
+(defun esh-tldr--check-command (command)
+  (let ((command (esh-tldr--command-from-string command)))
+    (unless command
+      (user-error "Command name is empty"))
+    (unless (esh-tldr--valid-command-p command)
+      (user-error "Illegal command name: %s" command))
+    command))
+
+(defun esh-tldr--target (beg end)
+  "Create a normal buffer target from BEG to END."
+  (esh-tldr--make-target
+   :buffer (current-buffer)
+   :start (copy-marker beg nil)
+   :end (copy-marker end t)
+   :original (buffer-substring-no-properties beg end)))
+
+(defun esh-tldr--command-token-in-buffer (beg end cursor)
+  "Return an absolute command token between BEG and END near CURSOR."
+  (let* ((input (buffer-substring-no-properties beg end))
+         (offset (- (max beg (min cursor end)) beg)))
+    (when-let* ((token (esh-tldr--command-token-in-string input offset)))
+      (list (car token)
+            (+ beg (nth 1 token))
+            (+ beg (nth 2 token))))))
+
+(defun esh-tldr--context-in-bounds (beg end cursor)
+  "Return a context parsed from BEG, END, and CURSOR."
+  (when-let* ((token (esh-tldr--command-token-in-buffer beg end cursor)))
+    (esh-tldr--make-context
+     :command (car token)
+     :target (esh-tldr--target (nth 1 token) (nth 2 token)))))
+
+(defun esh-tldr--region-context ()
+  (when (use-region-p)
+    (esh-tldr--context-in-bounds
+     (region-beginning) (region-end) (region-end))))
+
+(defun esh-tldr--comint-input-bounds ()
+  (when (derived-mode-p 'comint-mode)
+    (cons (comint-line-beginning-position) (line-end-position))))
+
+(defun esh-tldr--eshell-input-bounds ()
+  (when (and (derived-mode-p 'eshell-mode)
+             (boundp 'eshell-last-output-end)
+             (markerp eshell-last-output-end)
+             (marker-position eshell-last-output-end))
+    (cons (max (point-min) (marker-position eshell-last-output-end))
+          (point-max))))
+
+(defun esh-tldr--terminal-context ()
+  (when-let* ((bounds (or (esh-tldr--eshell-input-bounds)
+                          (esh-tldr--comint-input-bounds))))
+    (esh-tldr--context-in-bounds (car bounds) (cdr bounds) (point))))
+
+(defun esh-tldr--point-context ()
+  (when-let* ((bounds (or (bounds-of-thing-at-point 'filename)
+                          (bounds-of-thing-at-point 'symbol)))
+              (text (buffer-substring-no-properties
+                     (car bounds) (cdr bounds)))
+              (command (esh-tldr--command-from-string text)))
+    (esh-tldr--make-context
+     :command command
+     :target (esh-tldr--target (car bounds) (cdr bounds)))))
+
+(defun esh-tldr--context ()
+  (or (esh-tldr--region-context)
+      (run-hook-with-args-until-success 'esh-tldr-context-functions)
+      (esh-tldr--terminal-context)
+      (esh-tldr--point-context)))
+
+(defun esh-tldr--fallback-target ()
+  "Return a zero-width target suitable for the current buffer."
+  (or (run-hook-with-args-until-success 'esh-tldr-fallback-target-functions)
+      (esh-tldr--target (point) (point))))
+
+;;; Templates and safe replacement
+
+(defun esh-tldr--unsafe (format-string &rest args)
+  "Signal an expected unsafe-replacement error."
+  (signal 'esh-tldr-unsafe-replacement
+          (list (apply #'format format-string args))))
 
 (defun esh-tldr--plain-description (description)
   (let ((description (replace-regexp-in-string "[][]" "" description)))
@@ -260,7 +447,7 @@ When set to `auto', derive the platform from `system-type'."
         (if-let* ((cell (assoc name names)))
             (push `(s ,(cdr cell)) elements)
           (setq index (1+ index))
-          (let ((symbol (intern (format "esh-tldr-%d" index))))
+          (let ((symbol (make-symbol (format "esh-tldr-%d" index))))
             (push (cons name symbol) names)
             (push `(p ,name ,symbol) elements))))
       (setq start (match-end 0)))
@@ -274,111 +461,247 @@ When set to `auto', derive the platform from `system-type'."
     (if esh-tldr-use-tempel
         (progn
           (unless (require 'tempel nil t)
-            (user-error "Tempel is not available"))
+            (esh-tldr--unsafe "Tempel is not available"))
           (tempel-insert template))
       (let ((tempo-interactive t)
             (template-symbol (make-symbol "esh-tldr-tempo-template")))
         (set template-symbol template)
         (tempo-insert-template template-symbol nil)))))
 
-(defvar esh-tldr-mode-map
-  (let ((map (make-sparse-keymap)))
-    (set-keymap-parent map special-mode-map)
-    (define-key map (kbd "y") #'esh-tldr-copy-command)
-    (define-key map (kbd "RET") #'esh-tldr-insert-command)
-    (define-key map (kbd "e") #'esh-tldr-insert-command)
-    (define-key map (kbd "g") #'esh-tldr-reload)
-    (define-key map (kbd "n") #'esh-tldr-next-example)
-    (define-key map (kbd "p") #'esh-tldr-previous-example)
-    (define-key map (kbd "q") #'quit-window)
-    (define-key map (kbd "M-<") #'beginning-of-buffer)
-    (define-key map (kbd "M->") #'end-of-buffer)
-    map)
-  "Keymap for `esh-tldr-mode'.")
+(defun esh-tldr--target-bounds (target)
+  "Return live buffer positions for TARGET, or nil."
+  (let ((buffer (esh-tldr--target-buffer target))
+        (start (esh-tldr--target-start target))
+        (end (esh-tldr--target-end target)))
+    (when (and (buffer-live-p buffer)
+               (markerp start) (markerp end)
+               (eq (marker-buffer start) buffer)
+               (eq (marker-buffer end) buffer))
+      (when-let* ((beg (marker-position start))
+                  (end-pos (marker-position end))
+                  ((<= beg end-pos)))
+        (cons beg end-pos)))))
+
+(defun esh-tldr--replace-buffer-target (command target)
+  "Replace TARGET with COMMAND as a template.
+Return non-nil on success and signal an error when replacement is unsafe."
+  (let ((bounds (esh-tldr--target-bounds target)))
+    (unless bounds
+      (esh-tldr--unsafe "Source buffer no longer exists"))
+    (with-current-buffer (esh-tldr--target-buffer target)
+      (when buffer-read-only
+        (esh-tldr--unsafe "Source buffer is read-only"))
+      (pcase-let ((`(,beg . ,end) bounds))
+        (unless (equal (buffer-substring-no-properties beg end)
+                       (esh-tldr--target-original target))
+          (esh-tldr--unsafe "Source command changed while the page was open"))
+        (pop-to-buffer (current-buffer))
+        (condition-case err
+            (atomic-change-group
+              (delete-region beg end)
+              (goto-char beg)
+              (esh-tldr--insert-template command))
+          (text-read-only
+           (esh-tldr--unsafe "%s" (error-message-string err))))
+        t))))
+
+(defun esh-tldr--copy (command &optional reason)
+  (kill-new command)
+  (if reason
+      (message "Could not replace input (%s); copied: %s" reason command)
+    (message "Copied: %s" command)))
+
+(defun esh-tldr--use-command (command target)
+  "Use COMMAND at TARGET, falling back to copying on unsafe replacement."
+  (condition-case err
+      (if-let* ((handler (esh-tldr--target-handler target)))
+          (funcall handler command target)
+        (esh-tldr--replace-buffer-target command target))
+    (esh-tldr-unsafe-replacement
+     (esh-tldr--copy command (or (cadr err) (error-message-string err)))
+     nil)))
+
+;;; Help-style page
+
+(defvar-keymap esh-tldr-mode-map
+  :doc "Keymap for `esh-tldr-mode'."
+  :parent help-mode-map
+  "RET" #'esh-tldr-activate-or-insert
+  "w" #'esh-tldr-copy-command
+  "y" #'esh-tldr-copy-command
+  "n" #'esh-tldr-next-example
+  "p" #'esh-tldr-previous-example
+  "s" #'esh-tldr-search-command
+  "g" #'esh-tldr-reload)
 
 ;;;###autoload
-(define-derived-mode esh-tldr-mode special-mode "esh-tldr"
-  "Major mode for tldr pages.")
+(define-derived-mode esh-tldr-mode help-mode "esh-tldr"
+  "Major mode for interactive tldr help pages."
+  (setq-local truncate-lines nil)
+  (setq-local header-line-format
+              " RET use   w copy   TAB next action   n/p example   s search   g reload   q quit "))
 
-(defun esh-tldr--render-page (page)
-  (let ((inhibit-read-only t))
+(defun esh-tldr--formatted-command (command)
+  (let ((text (copy-sequence command))
+        (start 0))
+    (add-face-text-property 0 (length text) 'esh-tldr-command-face t text)
+    (while (string-match "{{[^{}]+}}" text start)
+      (add-face-text-property (match-beginning 0) (match-end 0)
+                              'esh-tldr-placeholder-face t text)
+      (setq start (match-end 0)))
+    text))
+
+(defun esh-tldr--target-summary (target)
+  (when target
+    (let ((original (esh-tldr--target-original target)))
+      (if (string-empty-p original)
+          "RET will insert at the original point."
+        (format "RET will replace: %s"
+                (truncate-string-to-width
+                 (replace-regexp-in-string "[\n\t ]+" " " original)
+                 100 nil nil "…"))))))
+
+(defun esh-tldr--insert-action-button (label index action)
+  (insert-text-button
+   label
+   'follow-link t
+   'help-echo (if (eq action 'copy) "Copy this command" "Use this command")
+   'esh-tldr-example index
+   'esh-tldr-action action
+   'action #'esh-tldr--button-action))
+
+(defun esh-tldr--button-action (button)
+  (let ((index (button-get button 'esh-tldr-example))
+        (action (button-get button 'esh-tldr-action)))
+    (esh-tldr--goto-example index)
+    (if (eq action 'copy)
+        (esh-tldr-copy-command)
+      (esh-tldr-insert-command))))
+
+(defun esh-tldr--render-empty-state (command)
+  (insert (propertize "No local TL;DR page is available.\n\n"
+                      'face 'warning))
+  (insert (format "Command: %s\nPages:   %s\n\n"
+                  command (abbreviate-file-name esh-tldr-pages-directory)))
+  (insert-text-button "[Search another command]"
+                      'follow-link t
+                      'action (lambda (_button) (esh-tldr-search-command)))
+  (when esh-tldr-executable
+    (insert "  ")
+    (insert-text-button "[Update pages]"
+                        'follow-link t
+                        'action (lambda (_button) (call-interactively #'esh-tldr-update))))
+  (insert "\n"))
+
+(defun esh-tldr--render-page (page command)
+  (let ((inhibit-read-only t)
+        first-example-position)
     (erase-buffer)
-    (insert (propertize (esh-tldr--page-title page) 'face 'esh-tldr-title-face)
+    (insert (propertize (or (and page (esh-tldr--page-title page)) command)
+                        'face 'esh-tldr-title-face)
             "\n\n")
-    (let ((description (esh-tldr--page-description page)))
-      (unless (string-empty-p description)
-        (insert description "\n\n")))
-    (insert (propertize "Source: " 'face 'esh-tldr-heading-face)
-            (abbreviate-file-name (esh-tldr--page-file page))
-            "\n\n")
-    (cl-loop for example in (esh-tldr--page-examples page)
-             for index from 0
-             do (let ((start (point)))
-                  (insert (propertize (concat "- " (esh-tldr--example-description example) "\n")
-                                      'face 'esh-tldr-heading-face))
-                  (insert (propertize (esh-tldr--example-command example)
-                                      'face 'esh-tldr-command-face))
-                  (insert "\n\n")
-                  (add-text-properties start (point)
-                                       `(esh-tldr-example ,index))))
-    (goto-char (point-min))
+    (when-let* ((description (and page (esh-tldr--page-description page)))
+                ((not (string-empty-p description))))
+      (insert description "\n\n"))
+    (when-let* ((summary (esh-tldr--target-summary esh-tldr--source-target)))
+      (insert (propertize summary 'face 'shadow) "\n\n"))
+    (cond
+     ((not page)
+      (esh-tldr--render-empty-state command))
+     ((null (esh-tldr--page-examples page))
+      (insert (propertize "This page contains no examples.\n" 'face 'warning)))
+     (t
+      (insert (propertize "Examples\n" 'face 'esh-tldr-heading-face))
+      (cl-loop for example in (esh-tldr--page-examples page)
+               for index from 0
+               do (let ((start (point)))
+                    (setq first-example-position
+                          (or first-example-position start))
+                    (insert "\n" (propertize
+                                    (esh-tldr--plain-description
+                                     (esh-tldr--example-description example))
+                                    'face 'esh-tldr-heading-face)
+                            "\n  ")
+                    (esh-tldr--insert-action-button
+                     (esh-tldr--formatted-command
+                      (esh-tldr--example-command example))
+                     index 'use)
+                    (insert "\n  ")
+                    (esh-tldr--insert-action-button "[Insert/replace]" index 'use)
+                    (insert "  ")
+                    (esh-tldr--insert-action-button "[Copy]" index 'copy)
+                    (insert "\n")
+                    (add-text-properties start (point)
+                                         `(esh-tldr-example ,index))))))
+    (when page
+      (insert "\n" (propertize "Source: " 'face 'esh-tldr-heading-face)
+              (abbreviate-file-name (esh-tldr--page-file page)) "\n"))
+    (goto-char (or first-example-position (point-min)))
     (set-buffer-modified-p nil)))
 
-(defun esh-tldr--show-page (page command source-marker)
+(defun esh-tldr--show-page (page command target)
   (esh-tldr-mode)
   (setq esh-tldr--command command
         esh-tldr--page page
-        esh-tldr--source-marker source-marker)
-  (esh-tldr--render-page page))
+        esh-tldr--source-target target)
+  (esh-tldr--render-page page command))
 
-(defun esh-tldr--open (command &optional example-index source-marker)
-  (let* ((page (esh-tldr--read-page command))
-         (buffer (get-buffer-create esh-tldr--buffer-name))
-         (source-marker (or source-marker (point-marker))))
+(defun esh-tldr--open (command &optional target)
+  (let* ((command (esh-tldr--check-command command))
+         (target (or target (esh-tldr--fallback-target)))
+         (page (esh-tldr--read-page command))
+         (buffer (get-buffer-create esh-tldr--buffer-name)))
     (with-current-buffer buffer
-      (esh-tldr--show-page page command source-marker)
-      (when example-index
-        (esh-tldr--goto-example example-index)))
+      (esh-tldr--show-page page command target))
     (pop-to-buffer buffer)))
 
-(defun esh-tldr--read-command ()
-  (let* ((default (esh-tldr--default-command))
+(defun esh-tldr--read-command (&optional default)
+  (let* ((entries (esh-tldr--command-candidate-entries))
+         (table (esh-tldr--completion-table entries))
          (prompt (if default
-                     (format "esh-tldr command (default %s): " default)
-                   "esh-tldr command: "))
-         (candidates (esh-tldr--command-candidates)))
+                     (format "TL;DR command (default %s): " default)
+                   "TL;DR command: ")))
     (esh-tldr--check-command
-     (if (require 'consult nil t)
-         (consult--read candidates
-                        :prompt prompt
-                        :category 'esh-tldr-command
-                        :default default
-                        :require-match nil
-                        :sort nil)
-       (completing-read prompt candidates nil nil nil nil default)))))
+     (completing-read prompt table nil nil nil
+                      'esh-tldr-command-history default))))
 
 ;;;###autoload
-(defun esh-tldr (command)
-  "Open the local tldr page for COMMAND."
-  (interactive (list (esh-tldr--read-command)))
-  (esh-tldr--open command))
+(defun esh-tldr (command &optional target)
+  "Search for COMMAND and open its local TL;DR page."
+  (interactive
+   (let* ((context (esh-tldr--context))
+          (target (or (and context (esh-tldr--context-target context))
+                      (esh-tldr--fallback-target)))
+          (default (and context (esh-tldr--context-command context))))
+     (list (esh-tldr--read-command default) target)))
+  (esh-tldr--open command target))
 
 ;;;###autoload
 (defun esh-tldr-at-point ()
-  "Open the local tldr page for the command at point."
+  "Open the local TL;DR page for the command at point."
   (interactive)
-  (let ((command (esh-tldr--command-at-point)))
-    (unless command
+  (let ((context (esh-tldr--point-context)))
+    (unless context
       (user-error "No command at point"))
-    (esh-tldr--open command)))
+    (esh-tldr--open (esh-tldr--context-command context)
+                    (esh-tldr--context-target context))))
 
 ;;;###autoload
 (defun esh-tldr-dwim ()
-  "Open a tldr page using region, shell input, point, or minibuffer input."
+  "Open a TL;DR page using region, terminal input, point, or completion."
   (interactive)
-  (if-let* ((command (esh-tldr--default-command)))
-      (esh-tldr--open command)
-    (call-interactively #'esh-tldr)))
+  (if-let* ((context (esh-tldr--context)))
+      (esh-tldr--open (esh-tldr--context-command context)
+                      (esh-tldr--context-target context))
+    (esh-tldr (esh-tldr--read-command) (esh-tldr--fallback-target))))
+
+(defun esh-tldr-search-command ()
+  "Search for another command while preserving the original source target."
+  (interactive)
+  (unless (derived-mode-p 'esh-tldr-mode)
+    (user-error "This command is only available in an esh-tldr page"))
+  (esh-tldr--open (esh-tldr--read-command esh-tldr--command)
+                  esh-tldr--source-target))
 
 (defun esh-tldr--current-example-index ()
   (or (get-text-property (point) 'esh-tldr-example)
@@ -387,155 +710,81 @@ When set to `auto', derive the platform from `system-type'."
 
 (defun esh-tldr--current-example ()
   (let ((index (esh-tldr--current-example-index)))
-    (unless index
-      (user-error "No esh-tldr example at point"))
+    (unless (and index esh-tldr--page)
+      (user-error "No TL;DR example at point"))
     (nth index (esh-tldr--page-examples esh-tldr--page))))
 
 (defun esh-tldr-copy-command ()
-  "Copy the current esh-tldr example command."
+  "Copy the current TL;DR example command."
   (interactive)
-  (let ((command (esh-tldr--example-command (esh-tldr--current-example))))
-    (kill-new command)
-    (message "Copied: %s" command)))
-
-(defun esh-tldr--ensure-marker-buffer (marker)
-  (unless (and marker
-               (marker-buffer marker)
-               (buffer-live-p (marker-buffer marker)))
-    (user-error "Source buffer no longer exists"))
-  (let ((buffer (marker-buffer marker)))
-    (when (buffer-local-value 'buffer-read-only buffer)
-      (user-error "Source buffer is read-only"))
-    buffer))
-
-(defun esh-tldr--insert-template-at-marker (command marker)
-  (let ((buffer (esh-tldr--ensure-marker-buffer marker)))
-    (pop-to-buffer buffer)
-    (goto-char marker)
-    (esh-tldr--insert-template command)))
+  (esh-tldr--copy
+   (esh-tldr--example-command (esh-tldr--current-example))))
 
 (defun esh-tldr--close-page-buffer (buffer window)
-  (when (and (window-live-p window)
-             (eq (window-buffer window) buffer))
-    (quit-window 'kill window))
-  (when (buffer-live-p buffer)
-    (kill-buffer buffer)))
+  (if (and (window-live-p window) (eq (window-buffer window) buffer))
+      (quit-window 'kill window)
+    (when (buffer-live-p buffer)
+      (kill-buffer buffer))))
 
 (defun esh-tldr-insert-command ()
-  "Insert the current esh-tldr example command as a template."
+  "Use the current TL;DR example at its saved source target."
   (interactive)
   (let ((command (esh-tldr--example-command (esh-tldr--current-example)))
         (page-buffer (current-buffer))
         (page-window (get-buffer-window (current-buffer) t))
-        (source-marker esh-tldr--source-marker))
-    (esh-tldr--insert-template-at-marker command source-marker)
-    (esh-tldr--close-page-buffer page-buffer page-window)))
+        (target esh-tldr--source-target))
+    (unless target
+      (user-error "No source target for this page"))
+    (when (esh-tldr--use-command command target)
+      (esh-tldr--close-page-buffer page-buffer page-window))))
 
-(defun esh-tldr--consult-display (command example)
-  (ignore command)
-  (esh-tldr--plain-description (esh-tldr--example-description example)))
-
-(defun esh-tldr--consult-candidates (command page source-marker)
-  (cl-loop for example in (esh-tldr--page-examples page)
-           for index from 0
-           for display = (esh-tldr--consult-display command example)
-           for data = (list :command command
-                            :index index
-                            :example example
-                            :source-marker source-marker)
-           collect (propertize display 'esh-tldr--consult-data data)))
-
-(defun esh-tldr--consult-data (candidate)
-  (get-text-property 0 'esh-tldr--consult-data candidate))
-
-(defun esh-tldr--consult-lookup (selected candidates &rest _)
-  (unless (string-empty-p selected)
-    (if-let* ((candidate (car (member selected candidates))))
-        (esh-tldr--consult-data candidate)
-      (esh-tldr--consult-data selected))))
-
-;;;###autoload
-(defun consult-esh-tldr (command)
-  "Select an esh-tldr example for COMMAND with Consult.
-An empty selection opens the command page without jumping to an example."
-  (interactive
-   (list (if current-prefix-arg
-             (esh-tldr--read-command)
-           (or (esh-tldr--default-command)
-               (esh-tldr--read-command)))))
-  (unless (require 'consult nil t)
-    (user-error "Consult is not available"))
-  (let* ((command (esh-tldr--check-command command))
-         (page (esh-tldr--read-page command))
-         (source-marker (point-marker))
-         (candidates (cons "" (esh-tldr--consult-candidates command page source-marker))))
-    (let ((data (consult--read candidates
-                               :prompt (format "esh-tldr %s: " command)
-                               :category 'esh-tldr-example
-                               :require-match t
-                               :sort nil
-                               :lookup #'esh-tldr--consult-lookup)))
-      (if data
-          (esh-tldr--open (plist-get data :command)
-                      (plist-get data :index)
-                      (plist-get data :source-marker))
-        (esh-tldr--open command nil source-marker)))))
-
-(defun esh-tldr-consult-insert-template (candidate)
-  "Insert the template for a `consult-esh-tldr' CANDIDATE.
-CANDIDATE must be the propertized string returned by
-`esh-tldr--consult-candidates'; intended to be invoked via Embark."
-  (let* ((data (esh-tldr--consult-data candidate))
-         (example (plist-get data :example)))
-    (esh-tldr--insert-template-at-marker
-     (esh-tldr--example-command example)
-     (plist-get data :source-marker))))
-
-(defvar esh-tldr-embark-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "e") #'esh-tldr-consult-insert-template)
-    map)
-  "Embark actions for `consult-esh-tldr' candidates.")
-
-(with-eval-after-load 'embark
-  (setf (alist-get 'esh-tldr-example embark-keymap-alist) 'esh-tldr-embark-map)
-  (setf (alist-get 'esh-tldr-example embark-default-action-overrides)
-        #'esh-tldr-consult-insert-template))
+(defun esh-tldr-activate-or-insert ()
+  "Activate the button at point, or use the current TL;DR example."
+  (interactive)
+  (if-let* ((button (button-at (point))))
+      (button-activate button)
+    (esh-tldr-insert-command)))
 
 (defun esh-tldr--goto-example (index)
-  (let ((pos (text-property-any (point-min) (point-max) 'esh-tldr-example index)))
+  (let ((pos (text-property-any (point-min) (point-max)
+                                'esh-tldr-example index)))
     (unless pos
-      (user-error "No esh-tldr example"))
+      (user-error "No TL;DR example"))
     (goto-char pos)
     (beginning-of-line)))
 
+(defun esh-tldr--move-example (delta)
+  (let ((count (length (and esh-tldr--page
+                            (esh-tldr--page-examples esh-tldr--page)))))
+    (when (zerop count)
+      (user-error "No TL;DR examples"))
+    (esh-tldr--goto-example
+     (mod (+ (or (esh-tldr--current-example-index)
+                 (if (> delta 0) -1 0))
+             delta)
+          count))))
+
 (defun esh-tldr-next-example ()
-  "Move to the next esh-tldr example."
+  "Move to the next TL;DR example, wrapping at the end."
   (interactive)
-  (let* ((examples (esh-tldr--page-examples esh-tldr--page))
-         (index (esh-tldr--current-example-index))
-         (next (if index (1+ index) 0)))
-    (when (>= next (length examples))
-      (user-error "No next esh-tldr example"))
-    (esh-tldr--goto-example next)))
+  (esh-tldr--move-example 1))
 
 (defun esh-tldr-previous-example ()
-  "Move to the previous esh-tldr example."
+  "Move to the previous TL;DR example, wrapping at the beginning."
   (interactive)
-  (let* ((index (esh-tldr--current-example-index))
-         (previous (if index (1- index) -1)))
-    (when (< previous 0)
-      (user-error "No previous esh-tldr example"))
-    (esh-tldr--goto-example previous)))
+  (esh-tldr--move-example -1))
 
 (defun esh-tldr-reload ()
-  "Reload the current tldr page."
+  "Reload the current TL;DR page, including an empty page."
   (interactive)
   (unless esh-tldr--command
-    (user-error "No tldr page in this buffer"))
-  (let ((page (esh-tldr--read-page esh-tldr--command)))
-    (setq esh-tldr--page page)
-    (esh-tldr--render-page page)
+    (user-error "No TL;DR page in this buffer"))
+  (let ((index (esh-tldr--current-example-index)))
+    (setq esh-tldr--page (esh-tldr--read-page esh-tldr--command))
+    (esh-tldr--render-page esh-tldr--page esh-tldr--command)
+    (when (and index esh-tldr--page
+               (< index (length (esh-tldr--page-examples esh-tldr--page))))
+      (esh-tldr--goto-example index))
     (message "Reloaded %s" esh-tldr--command)))
 
 (defun esh-tldr--refresh-open-buffers ()
@@ -548,7 +797,10 @@ CANDIDATE must be the propertized string returned by
 (defun esh-tldr-update ()
   "Run tldr --update asynchronously."
   (interactive)
-  (unless (and esh-tldr-executable (executable-find esh-tldr-executable))
+  (unless (and esh-tldr-executable
+               (or (and (file-name-absolute-p esh-tldr-executable)
+                        (file-executable-p esh-tldr-executable))
+                   (executable-find esh-tldr-executable)))
     (user-error "Could not find tldr executable"))
   (let ((buffer (get-buffer-create "*esh-tldr update*")))
     (with-current-buffer buffer
@@ -565,73 +817,19 @@ CANDIDATE must be the propertized string returned by
                (buffer (process-buffer process)))
            (if (zerop status)
                (progn
+                 (esh-tldr--clear-command-cache)
                  (esh-tldr--refresh-open-buffers)
-                 (message "tldr pages updated"))
-             (message "tldr update failed with status %s; see %s"
+                 (message "TL;DR pages updated"))
+             (message "TL;DR update failed with status %s; see %s"
                       status (buffer-name buffer)))))))))
 
-(defun esh-tldr--capf-bounds ()
-  (let ((beg (save-excursion
-               (skip-chars-backward "[:alnum:]_+@:%.,=/-")
-               (point)))
-        (end (save-excursion
-               (skip-chars-forward "[:alnum:]_+@:%.,=/-")
-               (point))))
-    (cons beg end)))
-
-(defun esh-tldr--capf-context ()
-  (let* ((bounds (esh-tldr--capf-bounds))
-         (beg (car bounds))
-         (end (cdr bounds))
-         (token (buffer-substring-no-properties beg end))
-         shell)
-    (cond
-     ((string-match "\\`\\([^/]+\\)/" token)
-      (list (match-string 1 token) beg end))
-     ((setq shell (esh-tldr--shell-command))
-      (list shell beg end))
-     ((not (string-empty-p token))
-      (list (esh-tldr--command-from-string token) beg end)))))
-
-;;;###autoload
-(defun capf-esh-tldr ()
-  "Complete esh-tldr examples at point."
-  (when-let* ((context (esh-tldr--capf-context))
-              (command (nth 0 context))
-              (beg (nth 1 context))
-              (end (nth 2 context))
-              (examples (ignore-errors
-                          (esh-tldr--page-examples (esh-tldr--read-page command)))))
-    (let* ((table (mapcar (lambda (example)
-                            (cons (esh-tldr--template-name command
-                                                       (esh-tldr--example-description example))
-                                  (esh-tldr--example-command example)))
-                          examples))
-           (candidates (mapcar #'car table)))
-      (when candidates
-        (list beg end candidates
-              :annotation-function
-              (lambda (candidate)
-                (concat "  " (cdr (assoc candidate table))))
-              :exit-function
-              (lambda (candidate status)
-                (when (eq status 'finished)
-                  (let ((start (- (point) (length candidate)))
-                        (command (cdr (assoc candidate table))))
-                    (delete-region start (point))
-                    (esh-tldr--insert-template command)))))))))
-
-;;;###autoload
-(defun esh-tldr-capf-setup ()
-  "Add `capf-esh-tldr' to `completion-at-point-functions' in the current buffer."
-  (interactive)
-  (add-hook 'completion-at-point-functions #'capf-esh-tldr nil t))
-
-(dolist (command '(esh-tldr-copy-command
+(dolist (command '(esh-tldr-activate-or-insert
+                   esh-tldr-copy-command
                    esh-tldr-insert-command
                    esh-tldr-next-example
                    esh-tldr-previous-example
-                   esh-tldr-reload))
+                   esh-tldr-reload
+                   esh-tldr-search-command))
   (function-put command 'command-modes '(esh-tldr-mode)))
 
 (provide 'esh-tldr)

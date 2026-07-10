@@ -1,15 +1,18 @@
 # esh-tldr
 
-`esh-tldr` is an Emacs package for browsing local [tldr pages](https://tldr.sh/), copying examples, and inserting examples as editable templates.
+`esh-tldr` is an Emacs 31 package for browsing local [tldr pages](https://tldr.sh/) and inserting their examples as editable command templates.
 
-It works well from regular buffers, `shell-mode`, `comint-mode`, and `eshell-mode`: run a command, ask for its tldr page, then copy or insert one of the examples.
+It understands regular buffers, `shell-mode`, `comint-mode`, and `eshell-mode`. Optional Ghostty support through [Ghostel](https://github.com/dakra/ghostel) lives in `esh-tldr-ghostty.el`. The package never executes an example command.
 
 ## Requirements
 
-- Emacs 27.1 or newer
-- A local checkout/cache of tldr pages
-- Optional: the `tldr` command-line client for `esh-tldr-update`
-- Optional: Consult, Embark, and Tempel integrations
+- Emacs 31 or newer
+- A local checkout or cache of tldr pages
+- Optional: the `tldr` command-line client for updating pages
+- Optional: Tempel as an alternative to the built-in Tempo template engine
+- Optional: Ghostel for native terminal integration
+
+The package uses Emacs' standard completion protocol. It does not depend on Consult, Vertico, Orderless, Marginalia, Embark, or a particular completion UI, but works with completion frontends configured by the user.
 
 ## Installation
 
@@ -18,30 +21,25 @@ Clone the repository somewhere on your `load-path`:
 ```elisp
 (add-to-list 'load-path "/path/to/esh-tldr")
 (require 'esh-tldr)
+(require 'esh-tldr-ghostty) ; Optional Ghostty/Ghostel integration
+(global-set-key (kbd "C-h t") #'esh-tldr-dwim)
 ```
 
-If you use `use-package`:
+With `use-package`:
 
 ```elisp
 (use-package esh-tldr
-  :load-path "/path/to/esh-tldr")
+  :load-path "/path/to/esh-tldr"
+  :bind ("C-h t" . esh-tldr-dwim))
+
+(use-package esh-tldr-ghostty
+  :load-path "/path/to/esh-tldr"
+  :after esh-tldr)
 ```
 
-## Setup
+## Page setup
 
-`esh-tldr` reads local markdown files from `esh-tldr-pages-directory`. By default it uses:
-
-```elisp
-~/.tldrc/tldr
-```
-
-If your tldr pages live somewhere else:
-
-```elisp
-(setq esh-tldr-pages-directory "/path/to/tldr")
-```
-
-The expected layout is the standard tldr repository layout, for example:
+By default, pages are read from `~/.tldrc/tldr` using the standard repository layout:
 
 ```text
 pages/common/tar.md
@@ -50,97 +48,102 @@ pages/osx/pbcopy.md
 pages.zh/common/tar.md
 ```
 
+Configure a different location when needed:
+
+```elisp
+(setq esh-tldr-pages-directory "/path/to/tldr")
+```
+
+Language and platform directories are selected automatically, with the base English and `common` pages used as fallbacks.
+
 ## Usage
 
-Open a page by command name:
+Use the context-aware entry point in most situations:
 
-```elisp
-M-x esh-tldr
-```
-
-Open the page for the command at point:
-
-```elisp
-M-x esh-tldr-at-point
-```
-
-Use the region, shell input, command at point, or prompt as a fallback:
-
-```elisp
+```text
 M-x esh-tldr-dwim
 ```
 
-If Consult is installed, select an example directly:
+It checks an active region, the current terminal input, and the command at point. If no command can be inferred, it opens the standard Emacs command completion UI.
 
-```elisp
-M-x consult-esh-tldr
+To always search for a command first:
+
+```text
+M-x esh-tldr
 ```
 
-Inside an `esh-tldr` buffer:
+Selecting a command opens a Help-style page. Missing commands open an empty-state page instead of failing or starting a network update.
+
+### Page actions
 
 | Key | Action |
 | --- | --- |
-| `y` | Copy the current example command |
-| `RET` or `e` | Insert the current example as a template in the source buffer |
-| `n` | Move to the next example |
-| `p` | Move to the previous example |
+| `RET` | Insert or replace with the selected example |
+| `w` or `y` | Copy the selected example |
+| `TAB` / `S-TAB` | Move between clickable actions |
+| `n` / `p` | Move between examples, wrapping at the ends |
+| `s` | Search for another command |
 | `g` | Reload the current page |
-| `q` | Quit the page buffer |
+| `q` | Close the page |
 
-## Templates
+Commands and the visible `[Insert/replace]` and `[Copy]` controls can also be clicked.
 
-tldr placeholders such as `{{source.tar}}` become editable template fields when inserted.
+## Safe replacement
 
-For example, this tldr command:
+The page records the source text it intends to replace. Existing commands are replaced rather than duplicated:
 
 ```text
-tar xf {{source.tar}} -C {{directory}}
+ls          + choose "ls -a"  => ls -a
+ls -l       + choose "ls -a"  => ls -a -l
+echo ok | ls -l               => echo ok | ls -a -l
+FOO=1 ls -l                    => FOO=1 ls -a -l
 ```
 
-is inserted as a template where `source.tar` and `directory` can be filled interactively.
+Only the detected command token is replaced. Existing arguments, environment assignments, pipelines, redirections, comments, and neighboring commands remain untouched. An active region limits command detection but does not cause its arguments to be deleted. In ordinary buffers, the command word at point is replaced. Without source context, the template is inserted at point.
 
-By default, `esh-tldr` uses Emacs' built-in Tempo. To use Tempel instead:
+Complex or incomplete shell syntax such as command substitutions, backticks, process substitutions, and unbalanced quotes is handled conservatively: DWIM declines automatic replacement and falls back to command search.
+
+If the source buffer becomes read-only, disappears, or changes while the page is open, the example is copied instead of overwriting newer text. Template insertion is atomic, so a Tempo or Tempel failure restores the original input.
+
+Placeholders such as `{{source.tar}}` become editable fields. Repeated placeholders share the same value.
+
+To use Tempel instead of Tempo:
 
 ```elisp
 (setq esh-tldr-use-tempel t)
 ```
 
-## Completion At Point
+## Ghostty through Ghostel
 
-To complete tldr examples at point in a buffer:
-
-```elisp
-M-x esh-tldr-capf-setup
-```
-
-or enable it from a mode hook:
+Ghostty support is isolated in `esh-tldr-ghostty.el` and is not loaded by the core package. Install Ghostel before enabling the adapter explicitly:
 
 ```elisp
-(add-hook 'eshell-mode-hook #'esh-tldr-capf-setup)
+(require 'esh-tldr-ghostty)
 ```
 
-Then complete strings like:
+The adapter registers itself when loaded and can be disabled again with `M-x esh-tldr-ghostty-teardown`.
+
+- In Ghostel `line` mode, `esh-tldr-dwim` reads and replaces the editable input directly.
+- In the default `semi-char` mode, opening a TL;DR page does not change modes. Pressing `RET` on an example switches the source terminal to `ghostel-line-mode`, adopts the current readline input, verifies that it has not changed, and then replaces only the selected command token.
+- Ghostel remains in line mode so Tempo or Tempel fields can be edited. Press `RET` in Ghostel to submit the finished command, or `C-c C-j` to return to semi-char mode.
+- In char, copy, or Emacs mode, inside a TUI, without a usable prompt, or when the input changed, the example is copied instead. `esh-tldr` never simulates `C-u`, backspaces, or other destructive terminal keys.
+
+Ghostel's default semi-char exceptions already allow the global `C-h t` binding to reach Emacs. If those exceptions were customized, ensure `C-h` remains in `ghostel-keymap-exceptions`.
+
+## Updating pages
+
+When `esh-tldr-executable` names an installed tldr client, update pages explicitly with:
 
 ```text
-tar/
-```
-
-and choose an example to insert.
-
-## Updating Pages
-
-If `esh-tldr-executable` points to the `tldr` command-line client, you can update local pages with:
-
-```elisp
 M-x esh-tldr-update
 ```
 
+The update runs asynchronously. Open TL;DR pages are reloaded after a successful update.
+
 ## Customization
 
-Useful options:
-
-- `esh-tldr-pages-directory`: root directory of local tldr pages
-- `esh-tldr-language`: language directory selection, or `auto`
-- `esh-tldr-platform`: platform directory selection, or `auto`
-- `esh-tldr-executable`: external `tldr` executable used for updates
-- `esh-tldr-use-tempel`: use Tempel instead of Tempo for template insertion
+- `esh-tldr-pages-directory`: root directory of local pages
+- `esh-tldr-language`: language selection or `auto`
+- `esh-tldr-platform`: platform selection or `auto`
+- `esh-tldr-executable`: executable used for explicit updates
+- `esh-tldr-use-tempel`: use Tempel instead of Tempo
